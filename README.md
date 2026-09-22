@@ -7,7 +7,8 @@ how much free tier AI have you burned through today? little widget for the
 
 ## what you get
 
-- :bar_chart: today's tokens in the bar - fresh tokens up front, - :moneybag: how many $$$ of paid API calls your free traffic replaced
+- :bar_chart: today's tokens in the bar - fresh tokens up front,
+- :moneybag: how many $$$ of paid API calls your free traffic replaced
 - :sparkles: 7-day sparkline, per-provider free-tier limit rings, per-model rows
 - :gear: settings for basically everything, changes apply instantly
 - :mouse: left-click opens/closes, middle-click refreshes, right-click
