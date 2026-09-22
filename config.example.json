@@ -1,0 +1,10 @@
+{
+  "budgets": {
+    "opencode":     { "daily_requests": 300 },
+    "ollama-cloud": { "daily_requests": 200 },
+    "nvidia":       { "per_minute": 40 }
+  },
+  "openrouter_credits": false,
+  "count_cache": false,
+  "hide_providers": []
+}

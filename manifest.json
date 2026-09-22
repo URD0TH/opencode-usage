@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "paudelsamir.opencode-usage",
+  "name": "OpenCode Usage",
+  "version": "1.0.0",
+  "author": "you",
+  "description": "Tokens used in OpenCode today, plus per-provider and per-model free-tier limits as progress bars",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenCode Usage",
+    "description": "OpenCode logo and today's token count in the bar. Click for daily usage, free-tier limits and per-model bars.",
+    "category": "AI",
+    "aliases": [
+      "opencode",
+      "tokens",
+      "usage"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

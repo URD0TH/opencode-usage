@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Reads OpenCode's local SQLite database (read-only) and prints one JSON
+document for the bar widget: today's tokens, a 7-day history, and per provider
+the free-tier limits with how much of each is used, broken down per model.
+
+Free traffic is priced against the models.dev catalog opencode already caches,
+quoted vs a baseline (default mid-tier rates). Adds top-level "savings",
+per-day "saved" and per-model "saved"/"spent".
+
+Usage: opencode-usage [config.json] [opencode.db]
+No network access, no API keys, standard library only.
+"""
+import collections
+import json, os, re, sqlite3, statistics, sys, time
+from datetime import datetime, timedelta, timezone
+
+DEFAULT_CONFIG = os.path.expanduser("~/.config/opencode-usage/config.json")
+DB_CANDIDATES = [
+    os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "opencode", "opencode.db"),
+    os.path.expanduser("~/.local/share/opencode/opencode.db"),
+]
+
+# Published free-tier limits. None means "no published number": the widget then
+# shows counts only, unless you set a budget yourself in config.json.
+# Preconfigured for common providers — they'll appear once you use them.
+PROVIDERS = {
+    "openrouter": {"name": "OpenRouter", "daily": 50, "minute": 20, "free_only": True, "reset": "utc",
+                   "note": "Only :free models count. 1000/day after buying $10 of credits.", "icon": "\uf4d7"},
+    "opencode": {"name": "OpenCode Zen", "daily": None, "minute": None, "reset": "local",
+                 "note": "No published cap for free models; the lineup rotates.", "icon": "\uf121"},
+    "ollama-cloud": {"name": "Ollama Cloud", "daily": None, "minute": None, "reset": "local",
+                      "note": "GPU-time limits (5h session, 7 days). Set a budget to get a bar.", "icon": "\uf0c2"},
+    "ollama": {"name": "Ollama (Local)", "daily": None, "minute": None, "reset": "local",
+               "note": "Local inference. No remote limits.", "icon": "\uf233"},
+    "omniroute": {"name": "OmniRoute", "daily": None, "minute": None, "reset": "local",
+                  "note": "Local gateway routing to 1000+ models. Set a budget for a bar.", "icon": "\uf074"},
+    "lmstudio": {"name": "LM Studio", "daily": None, "minute": None, "reset": "local",
+                 "note": "Local inference. No remote limits.", "icon": "\uf0c3"},
+    "llamacpp": {"name": "llama.cpp", "daily": None, "minute": None, "reset": "local",
+                 "note": "Local inference. No remote limits.", "icon": "\uf120"},
+    "vllm": {"name": "vLLM", "daily": None, "minute": None, "reset": "local",
+             "note": "Local inference. No remote limits.", "icon": "\uf0e7"},
+    "localai": {"name": "LocalAI", "daily": None, "minute": None, "reset": "local",
+                "note": "Local inference. No remote limits.", "icon": "\uf2db"},
+    "anthropic": {"name": "Anthropic", "daily": None, "minute": None, "reset": "local",
+                  "note": "Direct Claude API. Set a budget for tracking.", "icon": "\uf085"},
+    "openai": {"name": "OpenAI", "daily": None, "minute": None, "reset": "local",
+               "note": "Direct OpenAI API. Set a budget for tracking.", "icon": "\uf0eb"},
+    "google": {"name": "Google AI", "daily": None, "minute": None, "reset": "local",
+               "note": "Direct Gemini API. Set a budget for tracking.", "icon": "\uf1a0"},
+}
+ALIASES = {"ollama": "ollama"}
+
+
+# ---------------------------------------------------------------- savings
+# Pricing engine: a model counts as free when opencode itself says it costs
+# nothing (zero-cost provider block, e.g. local runtimes or :free gateway
+# models). Free traffic is priced by display-name match against the models.dev
+# catalog opencode caches in ~/.cache/opencode/models.json (median published
+# price of matches).
+SAVINGS_CATALOG = os.path.expanduser("~/.cache/opencode/models.json")
+SAVINGS_CONFIG_DIRS = ["~/.config/opencode", "~/.opencode"]
+SAVINGS_OVERRIDES = os.path.expanduser("~/.config/omarchy/agents/opencode.json")
+
+# in, out, cache_read, cache_write, USD per 1M tokens.
+SAVINGS_FALLBACK = (0.20, 1.00, 0.05, 0.05)
+# The default reference is a price point, not a product: mid-tier rates as
+# published across hosted providers (median of budget catalog entries, e.g.
+# qwen3-coder 0.30/1.00, gemini-2.5-flash 0.30/2.50, deepseek-chat 0.32/0.89,
+# gpt-4o-mini 0.15/0.60; cache_write follows the engine's 1.25x input rule).
+# Name an actual model in the overrides file if you want the comparison
+# quoted against frontier rates or one product instead.
+SAVINGS_BASELINE = ("mid tier", (0.30, 0.90, 0.075, 0.375))
+SAVINGS_STOPWORDS = {"free", "thinking", "instruct", "chat", "preview", "beta", "tee",
+             "fp8", "bf16", "nvfp4", "awq", "gguf", "uncensored", "heretic",
+             "obliterated", "abliterated"}
+
+
+def _sav_overrides():
+    try:
+        with open(SAVINGS_OVERRIDES) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _sav_baseline():
+    cfg = _sav_overrides().get("baseline") or {}
+    if cfg.get("price"):
+        return str(cfg.get("name", "baseline")), tuple(cfg["price"])
+    return SAVINGS_BASELINE
+
+
+def _sav_catalog():
+    try:
+        with open(SAVINGS_CATALOG) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _sav_opencode_config():
+    merged = {}
+    for directory in SAVINGS_CONFIG_DIRS:
+        path = os.path.join(os.path.expanduser(directory), "opencode.json")
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        for provider, spec in (data.get("provider") or {}).items():
+            entry = merged.setdefault(provider, {"name": "", "models": {}})
+            entry["name"] = spec.get("name") or entry["name"]
+            entry["models"].update(spec.get("models") or {})
+    return merged
+
+
+def _sav_price_tuple(cost):
+    if not cost:
+        return None
+    inp, out = cost.get("input"), cost.get("output")
+    if not inp and not out:
+        return None
+    inp = inp or 0.0
+    return (inp, out or 0.0,
+            cost.get("cache_read", inp * 0.1),
+            cost.get("cache_write", inp * 1.25))
+
+
+def _sav_catalog_price(cat, provider, model):
+    entry = ((cat.get(provider) or {}).get("models") or {}).get(model) or {}
+    return _sav_price_tuple(entry.get("cost"))
+
+
+def _sav_normalize(text):
+    text = re.sub(r"\(.*?\)", " ", str(text or "")).lower()
+    return [w for w in re.split(r"[^a-z0-9.]+", text) if w and w not in SAVINGS_STOPWORDS]
+
+
+def _sav_match_score(wanted, candidate):
+    score = 0
+    for word in wanted:
+        if word in candidate:
+            score += 1
+        elif score:
+            break
+    return score
+
+
+def _sav_equivalent_price(cat, display_name, fallback=SAVINGS_FALLBACK):
+    wanted = _sav_normalize(display_name)
+    if len(wanted) < 2:
+        return fallback
+    best, matches = 0, []
+    for provider, spec in cat.items():
+        for model_id, model in (spec.get("models") or {}).items():
+            price = _sav_price_tuple(model.get("cost"))
+            if not price:
+                continue
+            score = max(_sav_match_score(wanted, _sav_normalize(model.get("name"))),
+                        _sav_match_score(wanted, _sav_normalize(model_id)))
+            if score < 2 or score < best:
+                continue
+            if score > best:
+                best, matches = score, []
+            matches.append(price)
+    if not matches:
+        return fallback
+    return tuple(statistics.median(m[i] for m in matches) for i in range(4))
+
+
+class _Pricer:
+    def __init__(self):
+        self.catalog = _sav_catalog()
+        self.config = _sav_opencode_config()
+        cfg = _sav_overrides()
+        self.explicit = {k: tuple(v) for k, v in (cfg.get("equivalents") or {}).items()}
+        self.forced_free = set(cfg.get("free") or ())
+        self.forced_paid = set(cfg.get("paid") or ())
+        self._cache = {}
+
+    def _declared(self, provider, model):
+        return ((self.config.get(provider) or {}).get("models") or {}).get(model)
+
+    def display_name(self, provider, model):
+        declared = self._declared(provider, model)
+        if declared and declared.get("name"):
+            return declared["name"]
+        entry = ((self.catalog.get(provider) or {}).get("models") or {}).get(model) or {}
+        return entry.get("name") or model
+
+    def is_free(self, key):
+        if key in self.forced_paid:
+            return False
+        if key in self.forced_free:
+            return True
+        provider, _, model = key.partition("/")
+        declared = self._declared(provider, model)
+        if declared is not None:
+            cost = declared.get("cost") or {}
+            return not (cost.get("input") or cost.get("output"))
+        return _sav_catalog_price(self.catalog, provider, model) is None
+
+    def price(self, key):
+        if key in self._cache:
+            return self._cache[key]
+        provider, _, model = key.partition("/")
+        if key in self.explicit:
+            equivalent = _sav_catalog_price(self.catalog, *self.explicit[key]) or SAVINGS_FALLBACK
+        else:
+            equivalent = (_sav_catalog_price(self.catalog, provider, model)
+                          or _sav_equivalent_price(self.catalog,
+                                                   self.display_name(provider, model)))
+        charged = None if self.is_free(key) else equivalent
+        self._cache[key] = (charged, equivalent)
+        return self._cache[key]
+
+
+def _sav_cost(counters, price):
+    if not price:
+        return 0.0
+    return (counters.get("input", 0) * price[0]
+            + counters.get("output", 0) * price[1]
+            + counters.get("cache_read", 0) * price[2]
+            + counters.get("cache_write", 0) * price[3]) / 1e6
+
+
+def _sav_rate(per_model, pricer, base_price):
+    paid = equivalent = 0.0
+    totals = collections.Counter()
+    for key, counters in per_model.items():
+        charged, cloud = pricer.price(key)
+        paid += _sav_cost(counters, charged)
+        equivalent += _sav_cost(counters, cloud)
+        totals.update(counters)
+    return paid, equivalent, _sav_cost(totals, base_price)
+
+
+def fmt_money(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "$0.00"
+    if v >= 100:
+        return "$%.0f" % v
+    if v >= 10:
+        return "$%.1f" % v
+    return "$%.2f" % v
+
+
+
+def fmt_tokens(n):
+    n = int(n)
+    if n >= 1_000_000:
+        return ("%.1fM" % (n / 1e6)).replace(".0M", "M")
+    if n >= 1_000:
+        return ("%.1fk" % (n / 1e3)).replace(".0k", "k") if n < 100_000 else "%dk" % round(n / 1e3)
+    return str(n)
+
+
+def fmt_delta(seconds):
+    seconds = max(0, int(seconds))
+    h, m = seconds // 3600, (seconds % 3600) // 60
+    if h >= 24:
+        return "%dd %dh" % (h // 24, h % 24)
+    return "%dh %02dm" % (h, m) if h else "%dm" % max(m, 1)
+
+
+def level(pct):
+    return "danger" if pct >= 85 else "warn" if pct >= 60 else "ok"
+
+
+def fail(msg, hint=""):
+    print(json.dumps({"ok": False, "error": msg, "hint": hint}))
+    sys.exit(0)
+
+
+def load_config(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("top level must be an object")
+        return cfg
+    except Exception as e:
+        fail("Invalid config file: %s" % e, path)
+
+
+def num(v, default=None):
+    try:
+        v = float(v)
+        return int(v) if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def main():
+    cfg_path = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else DEFAULT_CONFIG
+    cfg = load_config(cfg_path)
+    db = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else next((p for p in DB_CANDIDATES if os.path.exists(p)), "")
+    if not db or not os.path.exists(db):
+        fail("OpenCode database not found.", "Run opencode once. Looked in ~/.local/share/opencode/opencode.db")
+
+    now = time.time()
+    local_now = datetime.now().astimezone()
+    today0 = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_now = datetime.now(timezone.utc)
+    utc0 = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    since = today0 - timedelta(days=6)
+    since_ms = int(min(since.timestamp(), utc0.timestamp()) * 1000)
+
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2)
+        tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+        if "message" not in tables:
+            fail("This OpenCode database has no 'message' table.",
+                 "OpenCode 2 beta stores usage differently; only 1.x is supported.")
+        rows = con.execute("select time_created, data from message where time_created >= ?", (since_ms,)).fetchall()
+        con.close()
+    except sqlite3.Error as e:
+        fail("Could not read the OpenCode database: %s" % e, db)
+
+    count_cache = cfg.get("count_cache") is True
+    budgets = cfg.get("budgets") if isinstance(cfg.get("budgets"), dict) else {}
+    hidden = set(cfg.get("hide_providers") or [])
+
+    reqs = []  # (ts, provider, model, tokens, cost, in, out, cache_read, cache_write)
+    for ts_ms, raw in rows:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("role") != "assistant":
+            continue
+        tk = d.get("tokens")
+        if not isinstance(tk, dict):
+            continue
+        cache = tk.get("cache") if isinstance(tk.get("cache"), dict) else {}
+        inp = num(tk.get("input"), 0) or 0
+        out = (num(tk.get("output"), 0) or 0) + (num(tk.get("reasoning"), 0) or 0)
+        cread = num(cache.get("read"), 0) or 0
+        cwrite = num(cache.get("write"), 0) or 0
+        # opencode's own `total` (input+output+reasoning+cache, verified exact)
+        # is the accurate count; the manual sum is only for old rows w/o it.
+        tot = tk.get("total")
+        if isinstance(tot, (int, float)) and tot > 0:
+            total = int(tot)
+        else:
+            total = inp + out
+            if count_cache:
+                total += cread + cwrite
+        if total <= 0:
+            continue  # errored / aborted call: it produced nothing
+        m = d.get("model") if isinstance(d.get("model"), dict) else {}
+        prov = str(d.get("providerID") or m.get("providerID") or "unknown")
+        model = str(d.get("modelID") or m.get("modelID") or "unknown")
+        try:
+            cost = float(d.get("cost") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        reqs.append((ts_ms / 1000.0, prov, model, total, cost, inp, out, cread, cwrite))
+
+    # Bar number + 7-day history (local days). Headlines count fresh tokens
+    # (input+output); cache re-reads ride along separately, since lumping
+    # them in makes ordinary sessions read as tens of millions.
+    def _fresh(subset):
+        return sum(r[5] + r[6] for r in subset)
+
+    def _cached(subset):
+        return sum(r[7] + r[8] for r in subset)
+
+    week = []
+    week_bounds = []
+    for i in range(6, -1, -1):
+        d0 = today0 - timedelta(days=i)
+        d1 = d0 + timedelta(days=1)
+        day_reqs = [r for r in reqs if d0.timestamp() <= r[0] < d1.timestamp()]
+        t = _fresh(day_reqs)
+        cc = _cached(day_reqs)
+        week.append({"day": d0.strftime("%a"), "tokens": t, "label": fmt_tokens(t),
+                     "cached": cc, "cachedLabel": fmt_tokens(cc),
+                     "requests": len(day_reqs), "today": i == 0})
+        week_bounds.append((d0, d1))
+    today_reqs = [r for r in reqs if r[0] >= today0.timestamp()]
+    tokens_today = _fresh(today_reqs)
+    cached_today = _cached(today_reqs)
+
+    # Savings vs baseline (same 7-day window; cache tokens always priced).
+    try:
+        _pricer = _Pricer()
+        _base_name, _base_price = _sav_baseline()
+
+        def _per_model(subset):
+            per = {}
+            for r in subset:
+                key = "%s/%s" % (r[1], r[2])
+                c = per.setdefault(key, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+                c["input"] += r[5]
+                c["output"] += r[6]
+                c["cache_read"] += r[7]
+                c["cache_write"] += r[8]
+            return per
+
+        for idx, (d0, d1) in enumerate(week_bounds):
+            sub = [r for r in reqs if d0.timestamp() <= r[0] < d1.timestamp()]
+            _paid_est, _equiv, base = _sav_rate(_per_model(sub), _pricer, _base_price)
+            # Spend is opencode's own recorded cost (actuals); the catalog
+            # estimate is only the counterfactual for free traffic.
+            actual = round(sum(r[4] for r in sub), 4)
+            saved = max(0.0, base - actual)
+            week[idx]["saved"] = round(saved, 4)
+            week[idx]["savedLabel"] = fmt_money(saved)
+            week[idx]["spent"] = actual
+        _today_paid_est, _today_equiv, _today_base = _sav_rate(_per_model(today_reqs), _pricer, _base_price)
+        _today_actual = round(sum(r[4] for r in today_reqs), 4)
+        _today_saved = max(0.0, _today_base - _today_actual)
+        _week_saved = round(sum(w.get("saved", 0) for w in week), 4)
+        savings = {"today": round(_today_saved, 4), "todayLabel": fmt_money(_today_saved),
+                   "todaySpent": _today_actual,
+                   "week": _week_saved, "weekLabel": fmt_money(_week_saved),
+                   "baseline": _base_name, "currency": "USD"}
+    except Exception:
+        _pricer, _base_price, _base_name = None, None, ""
+        for w in week:
+            w["saved"] = 0.0
+            w["savedLabel"] = fmt_money(0)
+            w["spent"] = 0.0
+        savings = {"today": 0.0, "todayLabel": fmt_money(0), "todaySpent": 0.0,
+                   "week": 0.0, "weekLabel": fmt_money(0), "baseline": "", "currency": "USD"}
+
+    by_prov = {}
+    for r in reqs:
+        by_prov.setdefault(r[1], []).append(r)
+
+    providers = []
+    for pid, prs in by_prov.items():
+        if pid in hidden:
+            continue
+        # Every provider in the DB gets a section (unknown ones: counts only,
+        # robot icon). Nothing real is ever silently dropped.
+        spec = dict(PROVIDERS.get(ALIASES.get(pid, pid)) or PROVIDERS.get(pid) or
+                    {"name": pid.replace("-", " ").replace("_", " ").title(),
+                     "daily": None, "minute": None, "reset": "local",
+                     "note": "No published limit known. Counts only; set a budget in config.json for a bar.",
+                     "icon": "\U000f06a9"})
+        b = budgets.get(pid) or budgets.get(ALIASES.get(pid, pid)) or {}
+        if not isinstance(b, dict):
+            b = {}
+        daily = num(b.get("daily_requests"), spec.get("daily"))
+        minute = num(b.get("per_minute"), spec.get("minute"))
+        if pid == "openrouter" and cfg.get("openrouter_credits") is True and "daily_requests" not in b:
+            daily = 1000
+        utc_reset = spec.get("reset") == "utc"
+        start = utc0 if utc_reset else today0
+        end = start + timedelta(days=1)
+        free_only = bool(spec.get("free_only"))
+
+        def counted(r):
+            return (not free_only) or r[2].endswith(":free")
+
+        in_day = [r for r in prs if start.timestamp() <= r[0] < end.timestamp()]
+        used_day = sum(1 for r in in_day if counted(r))
+        used_min = sum(1 for r in prs if now - 60 <= r[0] <= now and counted(r))
+
+        limits = []
+        if daily:
+            pct = round(used_day * 100.0 / daily)
+            limits.append({"label": "Daily requests", "used": used_day, "limit": daily, "pct": pct,
+                           "level": level(pct), "right": "%d / %d" % (used_day, daily),
+                           "caption": "Resets in %s%s" % (fmt_delta(end.timestamp() - now), " (00:00 UTC)" if utc_reset else "")})
+        if minute:
+            pct = round(used_min * 100.0 / minute)
+            limits.append({"label": "Per minute", "used": used_min, "limit": minute, "pct": pct,
+                           "level": level(pct), "right": "%d / %d" % (used_min, minute),
+                           "caption": "Rolling 60 seconds"})
+
+        models = {}
+        for r in in_day:
+            e = models.setdefault(r[2], {"requests": 0, "tokens": 0, "cached": 0, "cost": 0.0,
+                                         "counted": counted(r),
+                                         "input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+            e["requests"] += 1
+            e["tokens"] += r[5] + r[6]
+            e["cached"] += r[7] + r[8]
+            e["cost"] += r[4]
+            e["input"] += r[5]
+            e["output"] += r[6]
+            e["cache_read"] += r[7]
+            e["cache_write"] += r[8]
+        mlist = []
+        for name, e in models.items():
+            paid = e["cost"] > 0
+            if _pricer is not None and _base_price is not None:
+                try:
+                    # spent = recorded actuals; saved = baseline counterfactual
+                    # minus actuals (free traffic costs 0, so saves it all).
+                    spent = round(e["cost"], 4)
+                    saved = max(0.0, _sav_cost(e, _base_price) - (spent if paid else 0.0))
+                except Exception:
+                    spent, saved = 0.0, 0.0
+            else:
+                spent, saved = 0.0, 0.0
+            if daily and e["counted"]:
+                ratio, kind = e["requests"] / float(daily), "limit"
+            elif used_day and e["counted"]:
+                ratio, kind = e["requests"] / float(used_day), "usage"
+            else:
+                ratio, kind = None, "none"
+            pct = round(ratio * 100) if ratio is not None else None
+            stats = "%d req · %s tok" % (e["requests"], fmt_tokens(e["tokens"]))
+            if e["cached"] > 0:
+                stats += " (+%s cached)" % fmt_tokens(e["cached"])
+            if saved >= 0.01:
+                stats += " · saved %s" % fmt_money(saved)
+            mlist.append({
+                "name": name, "requests": e["requests"], "tokens": e["tokens"],
+                "cached": e["cached"], "cachedLabel": fmt_tokens(e["cached"]),
+                "tag": ("paid $%.2f" % e["cost"]) if paid else ("free" if e["counted"] or not free_only else "not free"),
+                "paid": paid, "counted": e["counted"],
+                "stats": stats,
+                "saved": round(saved, 4), "savedLabel": fmt_money(saved),
+                "spent": round(spent, 4),
+                "ratio": ratio, "barKind": kind,
+                "pct": ("%d%%" % pct) if pct is not None else "",
+                "level": level(pct * (1 if kind == "limit" else 0)) if pct is not None else "ok",
+            })
+        mlist.sort(key=lambda m: (-m["requests"], m["name"]))
+        top = max((l["pct"] for l in limits), default=0)
+        day_fresh = sum(r[5] + r[6] for r in in_day)
+        day_cached = sum(r[7] + r[8] for r in in_day)
+        day_summary = "%d req · %s tok" % (len(in_day), fmt_tokens(day_fresh))
+        if day_cached > 0:
+            day_summary += " (+%s cached)" % fmt_tokens(day_cached)
+        providers.append({
+            "id": pid, "name": spec["name"], "icon": spec.get("icon", "\U000f06a9"), "note": spec.get("note", ""), "limits": limits,
+            "hasLimit": bool(limits), "level": level(top), "models": mlist,
+            "requests": len(in_day), "tokens": day_fresh,
+            "cached": day_cached,
+            "cachedLabel": fmt_tokens(day_cached),
+            "summary": day_summary,
+            "paidWarning": any(m["paid"] for m in mlist),
+            "_sort": (-len(in_day), pid),
+        })
+    providers.sort(key=lambda p: p.pop("_sort"))
+
+    print(json.dumps({
+        "ok": True, "error": "", "hint": "",
+        "today": {"tokens": tokens_today, "label": fmt_tokens(tokens_today), "requests": len(today_reqs),
+                  "cached": cached_today, "cachedLabel": fmt_tokens(cached_today)},
+        "week": week, "weekMax": max([w["tokens"] for w in week] + [1]),
+        "weekTotal": fmt_tokens(sum(w["tokens"] for w in week)),
+        "providers": providers,
+        "savings": savings,
+    }))
+
+
+if __name__ == "__main__":
+    main()
