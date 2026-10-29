@@ -498,10 +498,12 @@ def main():
 
         models = {}
         for r in prs:
-            e = models.setdefault(r[2], {"requests": 0, "tokens": 0, "cached": 0, "cost": 0.0,
+            e = models.setdefault(r[2], {"requests": 0, "day_requests": 0, "tokens": 0, "cached": 0, "cost": 0.0,
                                          "counted": counted(r),
                                          "input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
             e["requests"] += 1
+            if start.timestamp() <= r[0] < end.timestamp():
+                e["day_requests"] += 1
             e["tokens"] += r[5] + r[6]
             e["cached"] += r[7] + r[8]
             e["cost"] += r[4]
@@ -523,7 +525,7 @@ def main():
             else:
                 spent, saved = 0.0, 0.0
             if daily and e["counted"]:
-                ratio, kind = e["requests"] / float(daily), "limit"
+                ratio, kind = e["day_requests"] / float(daily), "limit"
             elif used_week and e["counted"]:
                 ratio, kind = e["requests"] / float(used_week), "usage"
             else:
