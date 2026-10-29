@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "paudelsamir.opencode-usage",
+  "id": "URD0TH.opencode-usage",
   "name": "OpenCode Usage",
-  "version": "1.0.0",
-  "author": "you",
+  "version": "1.0.1",
+  "author": "URD0TH",
   "description": "Tokens used in OpenCode today, plus per-provider and per-model free-tier limits as progress bars",
   "license": "MIT",
   "kinds": [

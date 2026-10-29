@@ -481,6 +481,7 @@ def main():
 
         in_day = [r for r in prs if start.timestamp() <= r[0] < end.timestamp()]
         used_day = sum(1 for r in in_day if counted(r))
+        used_week = sum(1 for r in prs if counted(r))
         used_min = sum(1 for r in prs if now - 60 <= r[0] <= now and counted(r))
 
         limits = []
@@ -496,7 +497,7 @@ def main():
                            "caption": "Rolling 60 seconds"})
 
         models = {}
-        for r in in_day:
+        for r in prs:
             e = models.setdefault(r[2], {"requests": 0, "tokens": 0, "cached": 0, "cost": 0.0,
                                          "counted": counted(r),
                                          "input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
@@ -523,8 +524,8 @@ def main():
                 spent, saved = 0.0, 0.0
             if daily and e["counted"]:
                 ratio, kind = e["requests"] / float(daily), "limit"
-            elif used_day and e["counted"]:
-                ratio, kind = e["requests"] / float(used_day), "usage"
+            elif used_week and e["counted"]:
+                ratio, kind = e["requests"] / float(used_week), "usage"
             else:
                 ratio, kind = None, "none"
             pct = round(ratio * 100) if ratio is not None else None
@@ -547,20 +548,20 @@ def main():
             })
         mlist.sort(key=lambda m: (-m["requests"], m["name"]))
         top = max((l["pct"] for l in limits), default=0)
-        day_fresh = sum(r[5] + r[6] for r in in_day)
-        day_cached = sum(r[7] + r[8] for r in in_day)
-        day_summary = "%d req · %s tok" % (len(in_day), fmt_tokens(day_fresh))
+        day_fresh = sum(r[5] + r[6] for r in prs)
+        day_cached = sum(r[7] + r[8] for r in prs)
+        day_summary = "%d req · %s tok" % (len(prs), fmt_tokens(day_fresh))
         if day_cached > 0:
             day_summary += " (+%s cached)" % fmt_tokens(day_cached)
         providers.append({
             "id": pid, "name": spec["name"], "icon": spec.get("icon", "\U000f06a9"), "note": spec.get("note", ""), "limits": limits,
             "hasLimit": bool(limits), "level": level(top), "models": mlist,
-            "requests": len(in_day), "tokens": day_fresh,
+            "requests": len(prs), "tokens": day_fresh,
             "cached": day_cached,
             "cachedLabel": fmt_tokens(day_cached),
             "summary": day_summary,
             "paidWarning": any(m["paid"] for m in mlist),
-            "_sort": (-len(in_day), pid),
+            "_sort": (-len(prs), pid),
         })
     providers.sort(key=lambda p: p.pop("_sort"))
 

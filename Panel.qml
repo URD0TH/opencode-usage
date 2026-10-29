@@ -10,8 +10,8 @@ import qs.Ui
 Panel {
   id: root
 
-  moduleName: "paudelsamir.opencode-usage"
-  ipcTarget: "paudelsamir.opencode-usage"
+  moduleName: "URD0TH.opencode-usage"
+  ipcTarget: "URD0TH.opencode-usage"
 
   readonly property string script:
     Qt.resolvedUrl("bin/opencode-usage").toString().replace(/^file:\/\//, "")

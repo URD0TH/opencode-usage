@@ -30,7 +30,7 @@ how much free tier AI have you burned through today? little widget for the
 ## install
 
 ```sh
-omarchy plugin add https://github.com/paudelsamir/opencode-usage.git --enable
+omarchy plugin add https://github.com/URD0TH/opencode-usage.git --enable
 ```
 
 <details>
@@ -41,7 +41,7 @@ drop this folder into `~/.config/omarchy/plugins/`, then
 
 ```sh
 omarchy-shell shell rescanPlugins
-omarchy plugin enable paudelsamir.opencode-usage
+omarchy plugin enable URD0TH.opencode-usage
 ```
 
 </details>
@@ -49,8 +49,8 @@ omarchy plugin enable paudelsamir.opencode-usage
 ## remove
 
 ```sh
-omarchy plugin disable paudelsamir.opencode-usage
-omarchy plugin remove paudelsamir.opencode-usage
+omarchy plugin disable URD0TH.opencode-usage
+omarchy plugin remove URD0TH.opencode-usage
 ```
 
 ## needs
