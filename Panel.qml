@@ -148,9 +148,9 @@ Panel {
   Timer { id: refreshDebounce; interval: 700; repeat: false; onTriggered: root.refresh() }
   FileView {
     id: dbWatcher
-    // Watch only: the OpenCode database is multi-GB, and a normal FileView
-    // reads the whole file into memory. blockLoading keeps it at mtime-only.
-    blockLoading: true
+    // Watch only: the OpenCode database is multi-GB, and FileView preloads
+    // (reads) the whole file. preload:false keeps it to a stat/mtime watcher.
+    preload: false
     watchChanges: true
     // watch the DB file; if custom dbPath is set use it, else default
     path: {
