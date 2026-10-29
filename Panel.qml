@@ -148,6 +148,9 @@ Panel {
   Timer { id: refreshDebounce; interval: 700; repeat: false; onTriggered: root.refresh() }
   FileView {
     id: dbWatcher
+    // Watch only: the OpenCode database is multi-GB, and a normal FileView
+    // reads the whole file into memory. blockLoading keeps it at mtime-only.
+    blockLoading: true
     watchChanges: true
     // watch the DB file; if custom dbPath is set use it, else default
     path: {
@@ -161,7 +164,7 @@ Panel {
       if (!base || String(base).trim()==="") base = (Quickshell.env("HOME")||"/home/sam") + "/.local/share"
       return base + "/opencode/opencode.db"
     }
-    onLoaded: refreshDebounce.restart()
+    onFileChanged: refreshDebounce.restart()
     onLoadFailed: {}
   }
 
