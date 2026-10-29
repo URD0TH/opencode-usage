@@ -314,10 +314,29 @@ def main():
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2)
         tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-        if "message" not in tables:
-            fail("This OpenCode database has no 'message' table.",
-                 "OpenCode 2 beta stores usage differently; only 1.x is supported.")
-        rows = con.execute("select time_created, data from message where time_created >= ?", (since_ms,)).fetchall()
+        if "message" not in tables and "session_message" not in tables:
+            fail("This OpenCode database has no message table.",
+                 "Expected 'message' (OpenCode 1.x) or 'session_message' (2.x).")
+        rows = []
+        seen = set()
+        # 1.x keeps every message (user + assistant) in `message`.
+        if "message" in tables:
+            for mid, ts, raw in con.execute(
+                    "select id, time_created, data from message where time_created >= ?",
+                    (since_ms,)):
+                seen.add(mid)
+                rows.append((ts, raw))
+        # 2.x moved the transcript to `session_message`, which is already
+        # split by role; skip anything 1.x also returned.
+        if "session_message" in tables:
+            for mid, ts, raw in con.execute(
+                    "select id, time_created, data from session_message"
+                    " where type = 'assistant' and time_created >= ?",
+                    (since_ms,)):
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                rows.append((ts, raw))
         con.close()
     except sqlite3.Error as e:
         fail("Could not read the OpenCode database: %s" % e, db)
@@ -332,7 +351,7 @@ def main():
             d = json.loads(raw)
         except Exception:
             continue
-        if not isinstance(d, dict) or d.get("role") != "assistant":
+        if not isinstance(d, dict) or d.get("role", "assistant") != "assistant":
             continue
         tk = d.get("tokens")
         if not isinstance(tk, dict):
@@ -355,7 +374,7 @@ def main():
             continue  # errored / aborted call: it produced nothing
         m = d.get("model") if isinstance(d.get("model"), dict) else {}
         prov = str(d.get("providerID") or m.get("providerID") or "unknown")
-        model = str(d.get("modelID") or m.get("modelID") or "unknown")
+        model = str(d.get("modelID") or m.get("modelID") or m.get("id") or "unknown")
         try:
             cost = float(d.get("cost") or 0)
         except (TypeError, ValueError):

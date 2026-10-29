@@ -57,7 +57,7 @@ omarchy plugin remove paudelsamir.opencode-usage
 
 | dependency | why |
 |---|---|
-| [opencode](https://opencode.ai) 1.x | reads its local database (`~/.local/share/opencode/opencode.db`) - read-only, no network, no API keys, nothing leaves your machine |
+| [opencode](https://opencode.ai) 1.x / 2.x | reads its local database (`~/.local/share/opencode/opencode.db`) - read-only, no network, no API keys, nothing leaves your machine |
 | `python3` (stdlib only) | the `bin/opencode-usage` data script |
 | [models.dev](https://models.dev) catalog | prices - opencode already caches it at `~/.cache/opencode/models.json` |
 
@@ -66,4 +66,7 @@ omarchy plugin remove paudelsamir.opencode-usage
 
 
 > [!NOTE]
-> Only OpenCode 1.x's `message` table is read; OpenCode 2 beta will show an error.
+> Both schemas are supported: OpenCode 1.x keeps messages in `message`, 2.x
+> moved them to `session_message`. Rows are read from whichever tables exist and
+> de-duplicated by message id, so a database that holds both (mid-migration)
+> counts each message once.
